@@ -1,17 +1,21 @@
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { BarChart3 } from 'lucide-react';
+import { BarChart3, Check, SlidersHorizontal } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { getParsedApiError, type ParsedApiError } from '../api/error';
 import { analysisApi } from '../api/analysis';
+import { historyApi } from '../api/history';
+import { agentApi, type SkillInfo } from '../api/agent';
 import { systemConfigApi } from '../api/systemConfig';
-import { ApiErrorAlert, ConfirmDialog, Button, EmptyState, InlineAlert } from '../components/common';
+import { ApiErrorAlert, Button, EmptyState, InlineAlert } from '../components/common';
 import { DashboardStateBlock } from '../components/dashboard';
 import { StockAutocomplete } from '../components/StockAutocomplete';
-import { HistoryList } from '../components/history';
-import { ReportMarkdown, ReportSummary } from '../components/report';
+import { StockHistoryTrendDrawer, StockBar } from '../components/history';
+import { ReportMarkdownDrawer } from '../components/report/ReportMarkdownDrawer';
+import { ReportSummary } from '../components/report/ReportSummary';
 import { TaskPanel } from '../components/tasks';
 import { useDashboardLifecycle, useHomeDashboardState } from '../hooks';
+import { useWatchlist } from '../hooks/useWatchlist';
 import type { SetupStatusResponse } from '../types/systemConfig';
 import { getReportText, normalizeReportLanguage } from '../utils/reportLanguage';
 
@@ -24,14 +28,20 @@ type MarketReviewNotice = {
 const HomePage: React.FC = () => {
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isSubmittingMarketReview, setIsSubmittingMarketReview] = useState(false);
   const [marketReviewNotice, setMarketReviewNotice] = useState<MarketReviewNotice>(null);
   const [marketReviewError, setMarketReviewError] = useState<ParsedApiError | null>(null);
   const [marketReviewReport, setMarketReviewReport] = useState<string | null>(null);
   const [marketReviewReportCopied, setMarketReviewReportCopied] = useState(false);
+  const [analysisSkills, setAnalysisSkills] = useState<SkillInfo[]>([]);
+  const [selectedStrategyId, setSelectedStrategyId] = useState('');
+  const [strategyMenuOpen, setStrategyMenuOpen] = useState(false);
   const marketReviewPollTimer = useRef<number | null>(null);
   const dashboardScrollRef = useRef<HTMLElement | null>(null);
+  const strategyMenuRef = useRef<HTMLDivElement | null>(null);
+  const strategyButtonRef = useRef<HTMLButtonElement | null>(null);
+  const strategyItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const strategyInitialFocusIndexRef = useRef<number | null>(null);
 
   const stopMarketReviewPolling = useCallback(() => {
     if (marketReviewPollTimer.current !== null) {
@@ -63,35 +73,41 @@ const HomePage: React.FC = () => {
     duplicateError,
     error,
     isAnalyzing,
-    historyItems,
-    selectedHistoryIds,
-    isDeletingHistory,
-    isLoadingHistory,
-    isLoadingMore,
-    hasMore,
     selectedReport,
     isLoadingReport,
+    isHistoryTrendOpen,
+    stockHistoryItems,
+    stockHistoryTotal,
+    stockHistoryHasMore,
+    isLoadingStockHistory,
+    isLoadingMoreStockHistory,
+    stockHistoryError,
+    stockHistoryFilters,
     activeTasks,
     markdownDrawerOpen,
     setQuery,
     clearError,
     loadInitialHistory,
     refreshHistory,
-    loadMoreHistory,
     selectHistoryItem,
-    toggleHistorySelection,
-    toggleSelectAllVisible,
-    deleteSelectedHistory,
     submitAnalysis,
     notify,
     setNotify,
     syncTaskCreated,
     syncTaskUpdated,
     syncTaskFailed,
+    refreshActiveTasks,
     removeTask,
     openMarkdownDrawer,
     closeMarkdownDrawer,
-    selectedIds,
+    openHistoryTrend,
+    closeHistoryTrend,
+    setStockHistoryRange,
+    loadMoreStockHistory,
+    stockBarItems,
+    isLoadingStockBar,
+    loadStockBar,
+    refreshStockBar,
   } = useHomeDashboardState();
 
   useEffect(() => {
@@ -117,9 +133,164 @@ const HomePage: React.FC = () => {
     };
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    agentApi.getSkills()
+      .then((response) => {
+        if (active) {
+          setAnalysisSkills(response.skills);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setAnalysisSkills([]);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!strategyMenuOpen) {
+      return;
+    }
+
+    const handlePointerDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Node && strategyMenuRef.current?.contains(target)) {
+        return;
+      }
+      setStrategyMenuOpen(false);
+    };
+
+    document.addEventListener('mousedown', handlePointerDown);
+    return () => document.removeEventListener('mousedown', handlePointerDown);
+  }, [strategyMenuOpen]);
+
+  useEffect(() => {
+    if (selectedStrategyId && !analysisSkills.some((skill) => skill.id === selectedStrategyId)) {
+      setSelectedStrategyId('');
+    }
+  }, [analysisSkills, selectedStrategyId]);
+
   const reportLanguage = normalizeReportLanguage(selectedReport?.meta.reportLanguage);
   const reportText = getReportText(reportLanguage);
   const isMarketReviewHistoryReport = selectedReport?.meta.reportType === 'market_review';
+  const isHistoryTrendUnavailable = !selectedReport || selectedReport.meta.reportType === 'market_review'
+    || !selectedReport.meta.stockCode;
+
+  useEffect(() => {
+    if (!isHistoryTrendUnavailable || !isHistoryTrendOpen) {
+      return;
+    }
+    closeHistoryTrend();
+  }, [closeHistoryTrend, isHistoryTrendOpen, isHistoryTrendUnavailable]);
+
+  const selectedStrategy = useMemo(
+    () => analysisSkills.find((skill) => skill.id === selectedStrategyId),
+    [analysisSkills, selectedStrategyId],
+  );
+  const selectedAnalysisSkills = useMemo(
+    () => (selectedStrategyId ? [selectedStrategyId] : undefined),
+    [selectedStrategyId],
+  );
+  const strategyOptions = useMemo(
+    () => [
+      { id: '', name: '默认策略', description: '沿用系统默认分析框架' },
+      ...analysisSkills.map((skill) => ({
+        id: skill.id,
+        name: skill.name,
+        description: skill.description,
+      })),
+    ],
+    [analysisSkills],
+  );
+  const closeStrategyMenu = useCallback((restoreFocus = false) => {
+    setStrategyMenuOpen(false);
+    if (restoreFocus) {
+      strategyButtonRef.current?.focus();
+    }
+  }, []);
+  const selectStrategy = useCallback((strategyId: string) => {
+    setSelectedStrategyId(strategyId);
+    setStrategyMenuOpen(false);
+  }, []);
+  const focusStrategyItem = useCallback((index: number) => {
+    const itemCount = strategyOptions.length;
+    if (itemCount === 0) {
+      return;
+    }
+    const nextIndex = (index + itemCount) % itemCount;
+    strategyItemRefs.current[nextIndex]?.focus();
+  }, [strategyOptions.length]);
+  const getSelectedStrategyIndex = useCallback(() => {
+    const selectedIndex = strategyOptions.findIndex((option) => option.id === selectedStrategyId);
+    return selectedIndex >= 0 ? selectedIndex : 0;
+  }, [selectedStrategyId, strategyOptions]);
+  useEffect(() => {
+    strategyItemRefs.current = strategyItemRefs.current.slice(0, strategyOptions.length);
+  }, [strategyOptions.length]);
+  useEffect(() => {
+    if (!strategyMenuOpen) {
+      return undefined;
+    }
+
+    const targetIndex = strategyInitialFocusIndexRef.current ?? getSelectedStrategyIndex();
+    strategyInitialFocusIndexRef.current = null;
+    const timeout = window.setTimeout(() => focusStrategyItem(targetIndex), 0);
+    return () => window.clearTimeout(timeout);
+  }, [focusStrategyItem, getSelectedStrategyIndex, strategyMenuOpen]);
+  const handleStrategyButtonKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') {
+      return;
+    }
+
+    event.preventDefault();
+    const targetIndex = event.key === 'ArrowUp' ? strategyOptions.length - 1 : 0;
+    if (strategyMenuOpen) {
+      focusStrategyItem(targetIndex);
+      return;
+    }
+    strategyInitialFocusIndexRef.current = targetIndex;
+    setStrategyMenuOpen(true);
+  }, [focusStrategyItem, strategyMenuOpen, strategyOptions.length]);
+  const handleStrategyMenuKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    const itemCount = strategyOptions.length;
+    if (itemCount === 0) {
+      return;
+    }
+
+    const currentIndex = strategyItemRefs.current.findIndex((item) => item === document.activeElement);
+    switch (event.key) {
+      case 'Escape':
+        event.preventDefault();
+        closeStrategyMenu(true);
+        break;
+      case 'ArrowDown':
+        event.preventDefault();
+        focusStrategyItem(currentIndex >= 0 ? currentIndex + 1 : 0);
+        break;
+      case 'ArrowUp':
+        event.preventDefault();
+        focusStrategyItem(currentIndex >= 0 ? currentIndex - 1 : itemCount - 1);
+        break;
+      case 'Home':
+        event.preventDefault();
+        focusStrategyItem(0);
+        break;
+      case 'End':
+        event.preventDefault();
+        focusStrategyItem(itemCount - 1);
+        break;
+      case 'Tab':
+        setStrategyMenuOpen(false);
+        break;
+      default:
+        break;
+    }
+  }, [closeStrategyMenu, focusStrategyItem, strategyOptions.length]);
   const setupNeedsAction = setupStatus ? !setupStatus.isComplete : false;
   const setupMissingLabels = useMemo(() => {
     if (!setupStatus) {
@@ -134,16 +305,36 @@ const HomePage: React.FC = () => {
   useDashboardLifecycle({
     loadInitialHistory,
     refreshHistory,
+    loadStockBar,
+    refreshStockBar,
     syncTaskCreated,
     syncTaskUpdated,
     syncTaskFailed,
+    refreshActiveTasks,
     removeTask,
   });
+
+  const watchlistState = useWatchlist();
 
   const handleHistoryItemClick = useCallback((recordId: number) => {
     void selectHistoryItem(recordId);
     setSidebarOpen(false);
   }, [selectHistoryItem]);
+
+  const [isDeletingStock, setIsDeletingStock] = useState(false);
+  const handleDeleteStock = useCallback(async (stockCode: string) => {
+    if (isDeletingStock) return;
+    setIsDeletingStock(true);
+    try {
+      await historyApi.deleteByCode(stockCode);
+      await refreshStockBar();
+      await refreshHistory(true);
+    } catch {
+      // error silently ignored
+    } finally {
+      setIsDeletingStock(false);
+    }
+  }, [isDeletingStock, refreshStockBar, refreshHistory]);
 
   const handleSubmitAnalysis = useCallback(
     (
@@ -156,9 +347,10 @@ const HomePage: React.FC = () => {
         stockName,
         originalQuery: query,
         selectionSource: selectionSource ?? 'manual',
+        skills: selectedAnalysisSkills,
       });
     },
-    [query, submitAnalysis],
+    [query, selectedAnalysisSkills, submitAnalysis],
   );
 
   const handleAskFollowUp = useCallback(() => {
@@ -183,8 +375,9 @@ const HomePage: React.FC = () => {
       originalQuery: selectedReport.meta.stockCode,
       selectionSource: 'manual',
       forceRefresh: true,
+      skills: selectedAnalysisSkills,
     });
-  }, [selectedReport, submitAnalysis]);
+  }, [selectedAnalysisSkills, selectedReport, submitAnalysis]);
 
   const pollMarketReviewStatus = useCallback(
     async (taskId: string) => {
@@ -340,45 +533,31 @@ const HomePage: React.FC = () => {
     );
   }, [marketReviewReport]);
 
-  const handleDeleteSelectedHistory = useCallback(() => {
-    void deleteSelectedHistory();
-    setShowDeleteConfirm(false);
-  }, [deleteSelectedHistory]);
-
   const sidebarContent = useMemo(
     () => (
       <div className="flex min-h-0 h-full flex-col gap-3 overflow-hidden">
         <TaskPanel tasks={activeTasks} />
-        <HistoryList
-          items={historyItems}
-          isLoading={isLoadingHistory}
-          isLoadingMore={isLoadingMore}
-          hasMore={hasMore}
-          selectedId={selectedReport?.meta.id}
-          selectedIds={selectedIds}
-          isDeleting={isDeletingHistory}
+        <StockBar
+          items={stockBarItems}
+          isLoading={isLoadingStockBar}
+          selectedStockCode={selectedReport?.meta.stockCode}
+          selectedRecordId={selectedReport?.meta.id}
           onItemClick={handleHistoryItemClick}
-          onLoadMore={() => void loadMoreHistory()}
-          onToggleItemSelection={toggleHistorySelection}
-          onToggleSelectAll={toggleSelectAllVisible}
-          onDeleteSelected={() => setShowDeleteConfirm(true)}
+          onDeleteStock={handleDeleteStock}
+          isDeleting={isDeletingStock}
           className="flex-1 overflow-hidden"
         />
       </div>
     ),
     [
       activeTasks,
-      hasMore,
-      historyItems,
-      isDeletingHistory,
-      isLoadingHistory,
-      isLoadingMore,
+      stockBarItems,
+      isLoadingStockBar,
       handleHistoryItemClick,
-      loadMoreHistory,
-      selectedIds,
+      handleDeleteStock,
+      isDeletingStock,
+      selectedReport?.meta.stockCode,
       selectedReport?.meta.id,
-      toggleHistorySelection,
-      toggleSelectAllVisible,
     ],
   );
 
@@ -388,7 +567,7 @@ const HomePage: React.FC = () => {
       className="flex h-[calc(100vh-5rem)] w-full flex-col overflow-hidden md:flex-row sm:h-[calc(100vh-5.5rem)] lg:h-[calc(100vh-2rem)]"
     >
       <div className="flex-1 flex flex-col min-h-0 min-w-0 max-w-full lg:max-w-6xl mx-auto w-full">
-        <header className="flex min-w-0 flex-shrink-0 items-center overflow-hidden px-3 py-3 md:px-4 md:py-4">
+        <header className="relative z-30 flex min-w-0 flex-shrink-0 items-center overflow-visible px-3 py-3 md:px-4 md:py-4">
           <div className="flex min-w-0 flex-1 flex-col gap-2.5 md:flex-row md:items-center">
             <div className="flex min-w-0 flex-1 items-center gap-2.5">
               <button
@@ -412,6 +591,58 @@ const HomePage: React.FC = () => {
                   className={inputError ? 'border-danger/50' : undefined}
                 />
               </div>
+              {analysisSkills.length > 0 ? (
+                <div ref={strategyMenuRef} className="relative flex-shrink-0">
+                  <button
+                    ref={strategyButtonRef}
+                    id="strategy-menu-button"
+                    type="button"
+                    aria-haspopup="menu"
+                    aria-expanded={strategyMenuOpen}
+                    aria-controls={strategyMenuOpen ? 'strategy-menu' : undefined}
+                    onClick={() => setStrategyMenuOpen((open) => !open)}
+                    onKeyDown={handleStrategyButtonKeyDown}
+                    disabled={isAnalyzing}
+                    className="home-surface-button flex h-10 max-w-[8.5rem] items-center gap-1.5 rounded-xl px-3 text-xs text-foreground disabled:cursor-not-allowed disabled:opacity-60 sm:max-w-[11rem]"
+                  >
+                    <SlidersHorizontal className="h-4 w-4 flex-shrink-0" aria-hidden="true" />
+                    <span className="truncate">{selectedStrategy?.name || '策略'}</span>
+                  </button>
+                  {strategyMenuOpen ? (
+                    <div
+                      id="strategy-menu"
+                      role="menu"
+                      aria-labelledby="strategy-menu-button"
+                      onKeyDown={handleStrategyMenuKeyDown}
+                      className="absolute right-0 top-11 z-[120] max-h-80 w-[min(18rem,calc(100vw-1.5rem))] overflow-y-auto rounded-xl border border-subtle bg-elevated p-1.5 text-sm text-foreground shadow-2xl"
+                    >
+                      {strategyOptions.map((option, index) => {
+                        const selected = selectedStrategyId === option.id;
+                        return (
+                          <button
+                            key={option.id || 'default'}
+                            ref={(node) => {
+                              strategyItemRefs.current[index] = node;
+                            }}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={selected}
+                            tabIndex={-1}
+                            onClick={() => selectStrategy(option.id)}
+                            className="flex w-full items-start gap-2 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-hover"
+                          >
+                            <Check className={`mt-0.5 h-4 w-4 flex-shrink-0 ${selected ? 'opacity-100' : 'opacity-0'}`} aria-hidden="true" />
+                            <span className="min-w-0">
+                              <span className="block font-medium">{option.name}</span>
+                              <span className="mt-0.5 line-clamp-2 block text-xs leading-5 text-muted-text">{option.description}</span>
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
             <div className="flex min-w-0 flex-shrink-0 items-center gap-2.5">
               <label className="flex h-10 flex-shrink-0 cursor-pointer items-center gap-1.5 rounded-xl border border-subtle bg-surface/60 px-3 text-xs text-secondary-text select-none transition-colors hover:border-subtle-hover hover:text-foreground">
@@ -580,7 +811,7 @@ const HomePage: React.FC = () => {
                 <DashboardStateBlock title="加载报告中..." loading />
               </div>
             ) : selectedReport ? (
-              <div className="max-w-4xl space-y-4 pb-8">
+              <div className={isHistoryTrendOpen ? 'max-w-6xl space-y-4 pb-8' : 'max-w-4xl space-y-4 pb-8'}>
                 <div className="flex flex-wrap items-center justify-end gap-2">
                   <Button
                     variant="home-action-ai"
@@ -607,6 +838,22 @@ const HomePage: React.FC = () => {
                   <Button
                     variant="home-action-ai"
                     size="sm"
+                    disabled={selectedReport.meta.id === undefined || isMarketReviewHistoryReport}
+                    className={isHistoryTrendOpen ? 'border-primary/70 bg-primary/15 text-primary shadow-glow-cyan' : undefined}
+                    onClick={() => {
+                      if (isHistoryTrendOpen) {
+                        closeHistoryTrend();
+                        return;
+                      }
+                      void openHistoryTrend();
+                    }}
+                  >
+                    <BarChart3 className="h-4 w-4" />
+                    历史趋势
+                  </Button>
+                  <Button
+                    variant="home-action-ai"
+                    size="sm"
                     disabled={selectedReport.meta.id === undefined}
                     onClick={openMarkdownDrawer}
                   >
@@ -616,7 +863,35 @@ const HomePage: React.FC = () => {
                     {reportText.fullReport}
                   </Button>
                 </div>
-                <ReportSummary data={selectedReport} isHistory />
+                {isHistoryTrendOpen ? (
+                  <StockHistoryTrendDrawer
+                    key={`stock-history-${selectedReport.meta.id}`}
+                    report={selectedReport}
+                    items={stockHistoryItems}
+                    total={stockHistoryTotal}
+                    hasMore={stockHistoryHasMore}
+                    isLoading={isLoadingStockHistory}
+                    isLoadingMore={isLoadingMoreStockHistory}
+                    error={stockHistoryError}
+                    filters={stockHistoryFilters}
+                    onClose={closeHistoryTrend}
+                    onRangeChange={(range) => void setStockHistoryRange(range)}
+                    onLoadMore={() => void loadMoreStockHistory()}
+                    onSelectRecord={(recordId) => void selectHistoryItem(recordId)}
+                    onRetry={() => void openHistoryTrend()}
+                  />
+                ) : (
+                  <ReportSummary
+                    data={selectedReport}
+                    isHistory
+                    watchlist={{
+                      isInWatchlist: watchlistState.isInWatchlist,
+                      onToggle: watchlistState.toggleWatchlist,
+                      isActioning: watchlistState.isActioning,
+                      actionMessage: watchlistState.actionMessage,
+                    }}
+                  />
+                )}
               </div>
             ) : (
               <div className="flex h-full items-center justify-center">
@@ -637,7 +912,8 @@ const HomePage: React.FC = () => {
       </div>
 
       {markdownDrawerOpen && selectedReport?.meta.id ? (
-        <ReportMarkdown
+        <ReportMarkdownDrawer
+          key={selectedReport.meta.id}
           recordId={selectedReport.meta.id}
           stockName={selectedReport.meta.stockName || ''}
           stockCode={selectedReport.meta.stockCode}
@@ -646,20 +922,6 @@ const HomePage: React.FC = () => {
         />
       ) : null}
 
-      <ConfirmDialog
-        isOpen={showDeleteConfirm}
-        title="删除历史记录"
-        message={
-          selectedHistoryIds.length === 1
-            ? '确认删除这条历史记录吗？删除后将不可恢复。'
-            : `确认删除选中的 ${selectedHistoryIds.length} 条历史记录吗？删除后将不可恢复。`
-        }
-        confirmText={isDeletingHistory ? '删除中...' : '确认删除'}
-        cancelText="取消"
-        isDanger={true}
-        onConfirm={handleDeleteSelectedHistory}
-        onCancel={() => setShowDeleteConfirm(false)}
-      />
     </div>
   );
 };
